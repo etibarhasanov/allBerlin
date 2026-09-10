@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "allberlin"
+version = "0.1.0"
+description = "Plan and price a Google Places sweep of every eatery in Berlin."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+allberlin = "berlin.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["berlin*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
