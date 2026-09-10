@@ -1,4 +1,4 @@
-"""The CLI runs, and says what it is supposed to say."""
+"""The CLI runs, and the commands that make claims make the right ones."""
 
 import pytest
 
@@ -6,60 +6,57 @@ from berlin.cli import main
 
 
 @pytest.mark.parametrize("argv", [
-    ["plan"], ["cost"], ["skus"], ["types"], ["facts"], ["commands"],
-    ["cost", "--min-reviews", "100"], ["cost", "--months", "3"],
-    ["plan", "--whole-area"], ["cost", "--tier", "full"],
+    ["grid"], ["categories"], ["categories", "--category", "retail"],
+    ["census"], ["census", "--res", "8"], ["cost"], ["profiles"], ["facts"],
+    ["skus"], ["score", "--profile", "footfall", "--res", "8"],
+    ["score", "--profile", "underserved", "--res", "8", "--top", "3"],
 ])
 def test_every_command_runs(argv, capsys):
     assert main(argv) == 0
     assert capsys.readouterr().out.strip()
 
 
-def test_cost_reaches_a_verdict_on_the_free_trial(capsys):
+def test_cost_reports_zero(capsys):
     main(["cost"])
-    assert "Free trial" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "COST: $0.00" in out
+    assert "IDs Only" in out
 
 
-def test_a_higher_bar_reports_a_smaller_bill(capsys):
+def test_cost_still_shows_what_detail_would_cost(capsys):
+    """Free is the headline, not the whole story -- the moment you want a name
+    attached to a count you are back to four figures."""
     main(["cost"])
-    low = capsys.readouterr().out
-    main(["cost", "--min-reviews", "200"])
-    high = capsys.readouterr().out
-    assert _headline(low) > _headline(high)
+    out = capsys.readouterr().out
+    assert "Pro" in out and "$3," in out
 
 
-def _headline(text):
-    for line in text.splitlines():
-        if "after the free tier" in line:
-            return float(line.split("$")[1].split()[0].replace(",", ""))
-    raise AssertionError("no cost line in output")
+def test_score_says_loudly_that_it_is_modelled(capsys):
+    main(["score", "--res", "8"])
+    out = capsys.readouterr().out
+    assert "MODELLED, NOT MEASURED" in out
 
 
-def test_commands_writes_a_runnable_script(tmp_path, capsys):
-    out = tmp_path / "sweep.sh"
-    assert main(["commands", "--out", str(out)]) == 0
-    text = out.read_text()
-    assert text.startswith("#!/usr/bin/env bash")
-    assert "set -euo pipefail" in text
-    # One scan per rectangle, and awkward boroughs get more than one.
-    from berlin.districts import DISTRICTS
-    assert text.count("allrestaurants scan") == sum(len(d.tiles) for d in DISTRICTS)
-    assert "--max-requests" in text
-    assert "--min-reviews 25" in text
-    assert "coffee_shop" in text
+def test_score_shows_the_weights_it_used(capsys):
+    """A score nobody can audit is a number, not a product."""
+    main(["score", "--profile", "retail_site", "--res", "8"])
+    out = capsys.readouterr().out
+    assert "rewards" in out and "punishes" in out
 
 
-def test_the_script_sweeps_cheap_boroughs_first(tmp_path):
-    out = tmp_path / "sweep.sh"
-    main(["commands", "--out", str(out)])
-    order = [line for line in out.read_text().splitlines() if line.startswith("# ")
-             and "calls," in line]
-    calls = [int(line.split("~")[1].split()[0]) for line in order]
-    assert calls == sorted(calls)
+def test_run_without_a_key_fails_cleanly(capsys, monkeypatch):
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
+    assert main(["run", "--res", "8", "--limit", "1"]) == 1
+    assert "API key" in capsys.readouterr().err
 
 
-def test_types_bare_is_pipeable(capsys):
-    assert main(["types", "--bare"]) == 0
-    out = capsys.readouterr().out.strip()
-    assert "\n" not in out and " " not in out
-    assert out.startswith("restaurant,")
+def test_census_offers_the_other_resolutions(capsys):
+    main(["census", "--res", "9"])
+    out = capsys.readouterr().out
+    assert "res 8:" in out and "res 10:" in out
+
+
+def test_categories_lists_the_full_type_list_on_request(capsys):
+    main(["categories", "--category", "food_drink"])
+    out = capsys.readouterr().out
+    assert "coffee_shop" in out

@@ -248,7 +248,13 @@ def refresh_cost(places: float, sku: Sku) -> Dict[str, float]:
 
 
 def ids_only_is_a_false_economy(places: float, total_eateries: float) -> Dict[str, float]:
-    """Why the free IDs-Only SKU does not make this free.
+    """Why the free IDs-Only SKU does not make a *rated* dataset free.
+
+    Scope matters here, and this function is about one half of it.  For a
+    census of counts -- how many private entities stand near a point, which is
+    what berlin/census.py prices -- IDs-Only is exactly the right SKU and the
+    whole job is free.  What follows applies only when the deliverable carries
+    ratings and review counts per place.
 
     Nearby Search Essentials (IDs Only) costs nothing, without limit, which
     invites an obvious plan: discover every place for free, then buy details

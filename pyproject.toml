@@ -5,12 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "allberlin"
 version = "0.1.0"
-description = "Plan and price a Google Places sweep of every eatery in Berlin."
+description = "Count every private entity in Berlin on a hex grid, and score locations from it."
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["h3>=4.0,<5"]
 
 [project.optional-dependencies]
+# The census runner borrows allRestaurants' Places client for retries, rate
+# limiting and the request budget.  Only `allberlin run` needs it.
+run = ["allrestaurants"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

@@ -1,5 +1,13 @@
 # Where `calls ≈ 5.0 × √(places × area)` comes from
 
+> **Scope.** This calibrates the *paid, review-bearing* sweep in
+> `berlin/cost.py` — the one that collects a rating and a review count for
+> every place and is priced per call. It is not what the hex census costs.
+> The census breaks saturation by splitting the type list rather than the
+> circle, is billed at the free IDs-Only SKU, and is measured separately —
+> see the "part that is easy to get wrong" section of the README, and
+> `CALLS_PER_EXCESS_MULTIPLE` in `berlin/census.py`.
+
 The estimate in allRestaurants assumes every saturated circle splits into four.
 That is a reasonable-sounding rule and it has already been wrong once, by a
 factor of 1.7 in the expensive direction: it priced Tallinn's district passes at
