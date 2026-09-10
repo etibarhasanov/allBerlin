@@ -23,6 +23,7 @@ from .hexgrid import resolution, resolution_table
 from .pricing import (DETAILS_ENTERPRISE, DETAILS_SKUS, FREE_TRIAL_USD,
                       NEARBY_PRO, NEARBY_SKUS, TEXT_SKUS)
 from .scoring import PROFILES, build_features, profile, score_cells, top_cells
+from .areas import Area, density_from_store, plan_areas
 
 
 def cmd_grid(args) -> int:
@@ -204,7 +205,11 @@ def cmd_run(args) -> int:
         return 1
 
     res = args.res or DEFAULT_SCORING_RESOLUTION
-    cells = hexgrid.berlin_cells(res)
+    if args.cells_file:
+        with open(args.cells_file) as fh:
+            cells = [line.strip() for line in fh if line.strip()]
+    else:
+        cells = hexgrid.berlin_cells(res)
     if args.limit:
         cells = cells[:args.limit]
     plan = plan_census(res=res)
@@ -262,6 +267,77 @@ def cmd_export(args) -> int:
         for r in rows:
             w.writerow(list(r) + [hexgrid.h3.latlng_to_cell(r[2], r[3], 9)])
     print(f"  wrote {len(rows):,} places to {args.out}")
+    return 0
+
+
+def _parse_areas(args) -> List[Area]:
+    if not args.at:
+        print("error: give at least one --at name:lat,lng:radius_km, e.g.\n"
+              '  --at "Alexanderplatz:52.5219,13.4132:2"', file=sys.stderr)
+        sys.exit(2)
+    try:
+        return [Area.parse(a) for a in args.at]
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_areas(args) -> int:
+    """Price a set of areas, and optionally write the cell list to run."""
+    areas = _parse_areas(args)
+    res = args.res or DEFAULT_SCORING_RESOLUTION
+    result = plan_areas(areas, res=res, months=args.months)
+    print(f"\n  Density of places, per area -- modelled, res {res}\n")
+    head = (f"  {'area':<22}{'radius':>7}{'cells':>7}{'places':>9}"
+            f"{'/km2':>8}{'/cell':>7}{'calls':>8}{'cost':>9}")
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for p in result["plans"]:
+        print(f"  {p.area.name:<22}{p.area.radius_km:>5.1f}km{len(p.cells):>7,}"
+              f"{p.places:>9,.0f}{p.per_km2:>8,.0f}{p.per_cell:>7.1f}"
+              f"{p.calls:>8,.0f}{p.usd:>9,.2f}")
+    b = result["billing"]
+    print("  " + "-" * (len(head) - 2))
+    print(f"  {'together':<22}{'':>7}{len(result['distinct_cells']):>7,}{'':>9}{'':>8}{'':>7}"
+          f"{result['calls']:>8,.0f}{b['usd_before_free_tier']:>9,.2f}")
+    print(f"\n  after {b['free_calls']:,.0f} free calls this month: "
+          f"${b['usd']:,.2f}")
+    print("  '/cell' is the average count inside one 205 m query circle -- above")
+    print("  20 the cell saturates and has to be split, which is what costs.\n")
+    if args.cells_out:
+        with open(args.cells_out, "w") as fh:
+            fh.write("\n".join(result["distinct_cells"]) + "\n")
+        print(f"  wrote {len(result['distinct_cells']):,} cells to {args.cells_out}")
+        print(f"  run them:  allberlin run --cells-file {args.cells_out}\n")
+    return 0
+
+
+def cmd_density(args) -> int:
+    """Measured density inside each area, from a census database."""
+    from .runner import CountStore
+
+    areas = _parse_areas(args)
+    if not os.path.exists(args.db):
+        print(f"error: no census at {args.db}. Run `allberlin run` first.",
+              file=sys.stderr)
+        return 1
+    store = CountStore(args.db)
+    try:
+        results = [density_from_store(store, a, args.res or DEFAULT_SCORING_RESOLUTION)
+                   for a in areas]
+    finally:
+        store.close()
+    cats = [c.key for c in CATEGORIES if c.private]
+    print(f"\n  Density of places, per area -- MEASURED from {args.db}\n")
+    head = f"  {'area':<22}{'cells done':>11}{'places':>8}{'/km2':>8}  top categories"
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for d in results:
+        top = sorted(d.by_category.items(), key=lambda kv: -kv[1])[:3]
+        tops = ", ".join(f"{k} {v}" for k, v in top)
+        flag = "" if d.cells else "  (no cells run yet)"
+        print(f"  {d.area.name:<22}{d.cells:>11,}{d.places:>8,}{d.per_km2:>8,.0f}  {tops}{flag}")
+    print()
     return 0
 
 
@@ -355,9 +431,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=5)
     p.add_argument("--limit", type=int, default=None,
                    help="Only the first N cells -- for a first look.")
+    p.add_argument("--cells-file", default=None,
+                   help="Run only these cells (one H3 id per line; see `areas --cells-out`).")
     p.add_argument("--max-requests", type=int, default=None,
                    help="Hard call cap. The run stops cleanly and resumes.")
     p.set_defaults(func=cmd_run)
+
+    p = with_res(sub.add_parser("areas", help="Price chosen areas; write their cells to run."))
+    p.add_argument("--at", action="append",
+                   help='Area as name:lat,lng:radius_km. Repeatable.')
+    p.add_argument("--cells-out", help="Write the distinct cell ids here for `run --cells-file`.")
+    p.set_defaults(func=cmd_areas)
+
+    p = with_res(sub.add_parser("density", help="Measured density per area, from a census DB."))
+    p.add_argument("--at", action="append", help='Area as name:lat,lng:radius_km. Repeatable.')
+    p.add_argument("--db", default="data/berlin_census.db")
+    p.set_defaults(func=cmd_density)
 
     p = sub.add_parser("export", help="Every place with coordinates and category, as CSV.")
     p.add_argument("--db", default="data/berlin_census.db")
