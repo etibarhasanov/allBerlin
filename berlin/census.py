@@ -159,6 +159,15 @@ CENTRE = (52.5200, 13.4050)          # Alexanderplatz, near enough
 GRADIENT_PEAK = 3.0                  # 4x the borough mean at the centre
 GRADIENT_DECAY_KM = 4.0
 
+# Borough densities applied cell by cell leave hard rectangular edges wherever
+# two boroughs meet, and those edges are an artefact of the rectangles in
+# districts.py rather than anything true about Berlin -- commercial density is
+# continuous, and a shop does not notice a borough boundary.  Smoothing over
+# the 2-ring removes the artefact without moving the total, which is
+# renormalised afterwards either way.  Weights fall off by ring distance.
+SMOOTHING_RINGS = 2
+SMOOTHING_WEIGHTS = (1.0, 0.6, 0.3)
+
 
 def cell_densities(res: int) -> List[float]:
     """Cached, because a res-10 grid is 71,000 point-in-rectangle tests."""
@@ -193,11 +202,38 @@ def _cell_densities(res: int) -> List[float]:
         if not in_built_up:
             density *= UNBUILT_DENSITY_RATIO
         raw.append(density * centre_gradient(lat, lng))
+    raw = _smooth(cells, raw)
     integral = sum(raw) * cell_area
     if integral <= 0:
         return raw
     scale = BERLIN_PRIVATE_ENTITIES / integral
     return [d * scale for d in raw]
+
+
+def _smooth(cells: Sequence[str], values: Sequence[float]) -> List[float]:
+    """Average each cell over its k-ring, weighted by ring distance.
+
+    Which is a use for the hex grid beyond indexing: a k-ring is one distance
+    in every direction, so a hex smooth has no preferred axis.  The same
+    operation on a square grid pulls along the diagonals.
+    """
+    index = {cell: i for i, cell in enumerate(cells)}
+    out = []
+    for cell in cells:
+        total = weight_sum = 0.0
+        inner = set()
+        for k in range(SMOOTHING_RINGS + 1):
+            weight = SMOOTHING_WEIGHTS[k]
+            disk = set(hexgrid.ring(cell, k))
+            for neighbour in disk - inner:          # the k-th ring alone
+                j = index.get(neighbour)
+                if j is None:                       # outside Berlin
+                    continue
+                total += values[j] * weight
+                weight_sum += weight
+            inner = disk
+        out.append(total / weight_sum if weight_sum else 0.0)
+    return out
 
 
 def centre_gradient(lat: float, lng: float) -> float:

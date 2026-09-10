@@ -111,3 +111,28 @@ def test_food_count_agrees_with_the_independent_eatery_estimate():
     food = cost_pass(by_key("food_drink"), 9).entities
     rated = build_plan().places        # eateries with 25+ reviews
     assert rated < food < 2.5 * rated
+
+
+def test_smoothing_removes_the_borough_edges_without_moving_the_total():
+    """Hard rectangular density edges are an artefact of the rectangles in
+    districts.py, not a claim about Berlin. Smoothing over the hex ring takes
+    them out; renormalising keeps the city total where it was."""
+    from berlin import hexgrid
+    from berlin.census import _smooth
+
+    cells = hexgrid.berlin_cells(8)
+    step = [100.0 if i < len(cells) // 2 else 0.0 for i in range(len(cells))]
+    smoothed = _smooth(cells, step)
+    jump_before = max(abs(step[i] - step[i - 1]) for i in range(1, len(step)))
+    jump_after = max(abs(smoothed[i] - smoothed[i - 1]) for i in range(1, len(smoothed)))
+    assert jump_after < jump_before
+    assert sum(smoothed) == pytest.approx(sum(step), rel=0.15)
+
+
+def test_a_flat_surface_survives_smoothing_unchanged():
+    from berlin import hexgrid
+    from berlin.census import _smooth
+
+    cells = hexgrid.berlin_cells(8)
+    flat = [7.0] * len(cells)
+    assert _smooth(cells, flat) == pytest.approx(flat)
