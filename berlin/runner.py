@@ -1,67 +1,60 @@
-"""Executing the census: one circle per hex cell, split where it saturates.
+"""Executing the census: one untyped circle per hex cell, quartered where it
+saturates, every result kept with its coordinates and its types.
 
 This is the only module that talks to Google.  It borrows allRestaurants'
-Places client for retries, rate limiting and the request budget, and adds the
-two things a hex census needs that a bounding-box sweep does not: attribution
-of every result to the cell whose circle found it, and place ids kept per cell
-so that counts stay exact under the overlap between neighbouring circles.
+Places client for retries, rate limiting and the request budget, and asks for
+the Pro field mask -- id, name, coordinates, types, primary type, address --
+because that is the cheapest tier Nearby Search has, and because coordinates
+and a category are what a location product needs beyond the id anyway.
 
-The stopping rule is the census one -- a query returning a full 20 is hiding
-more -- but *how* it is unhidden matters more here than in a bounding-box
-sweep, and the obvious answer is wrong.
+One pass, no type filter.  A request with no ``includedTypes`` returns the
+nearest twenty of everything Google indexes inside the circle, and every one
+of them says what it is, so the category is read off the response rather than
+inferred from which sweep found it.  Twelve typed passes become one.
 
-Splitting a saturated circle into four covering circles, which is what
-allRestaurants does, works fine when the target is an area: neighbouring
-circles overlap anyway and nothing is attributed to anything. It does not work
-when the target is a cell. The four children sit at (+/- r/2, +/- r/2) with
-radius r/sqrt(2), so they reach 1.43r from the centre and drag in places from
-well outside the cell they are supposed to be measuring. Measured on a test
-clump: 75 places returned for a circle holding 62, a 21% over-count. And it
-cannot be cleaned up afterwards, because an IDs-Only response carries no
-coordinates to filter on.
+Saturation -- a full twenty back, so more are hiding -- is broken by quartering
+the circle, as allRestaurants does.  Quartering over-reaches: the four children
+extend to 1.43r from the parent's centre and would drag in places from outside
+the cell.  With coordinates on every result that is a filter, not a flaw: a
+result is kept only if it lies inside the cell's own query circle.  The
+first version of this module could not do that, because it had no
+coordinates, and had to split the type list instead; that machinery is gone.
 
-So saturation is broken by **splitting the type list instead of the circle**.
-A cell that returns 20 for thirty retail types is asked again for fifteen of
-them, and again for the other fifteen, all against the identical circle. Every
-result is still exactly where it was, the union is the complete answer, and the
-count stays exact. It is free, so the extra calls cost only time -- and the
-subsets are useful in their own right, since they are finer categories.
-
-Only when a *single* type still saturates does geometry have to move, and then
-the cell descends to its seven H3 children rather than to four quadrants.
-Those cells are flagged as inexact rather than quietly reported alongside the
-others.
-
-There is no review bar here and there cannot be one: the IDs-Only response that
-makes this free carries no review count. That is fine -- the review bar existed
-to keep a *paid* sweep cheap, and nothing here is paid.
-
-Results are written as they arrive and the cell log is checked before each call,
-so an interrupted run resumes instead of paying for the same ground twice --
-free calls still cost hours.
+Results are written as they arrive and the cell log is checked before each
+call, so an interrupted run resumes instead of paying for the same ground
+twice.  At $32 per 1,000 that is money as well as hours.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from . import hexgrid
-from .entities import Category
+from .entities import CATEGORIES, Category
 
 log = logging.getLogger(__name__)
 
 MAX_RESULTS_PER_CALL = hexgrid.MAX_RESULTS_PER_CALL
 
-# How far a cell may descend when even a single type saturates it.  Two levels
-# takes a res-9 cell to res 11, a 29 m hexagon, which no single Google type
-# fills twenty deep.
-MAX_DESCENT = 2
+# How far a saturated circle may keep quartering.  Each level divides the
+# radius by sqrt(2) * 0.98 = 1.39, so eight levels take a res-9 cell's 205 m
+# circle to about 15 m -- a shopping mall's worth of ground, which is the
+# densest thing Google will hand back twenty of at once.  Only saturated
+# cells ever go this deep, so the ceiling costs nothing where it is not hit.
+MAX_DEPTH = 8
+MIN_RADIUS_M = 5.0
+
+# Pro-tier fields, and nothing from a dearer tier: one rating in this list
+# would re-price every call to Enterprise.
+FIELD_MASK = ",".join([
+    "places.id", "places.displayName", "places.location", "places.types",
+    "places.primaryType", "places.formattedAddress", "places.businessStatus",
+])
 
 
 @dataclass
@@ -72,19 +65,43 @@ class CensusStats:
     calls: int = 0
     splits: int = 0
     max_depth: int = 0
-    entities: int = 0
-    # Cells whose count needed the grid to move, and so may over-count.
-    inexact_cells: int = 0
+    places: int = 0
+    # Results returned by a child circle but outside the parent -- clipped.
+    clipped: int = 0
+
+
+# Google type -> the first category in entities.py that lists it.  Order in
+# CATEGORIES is therefore a priority: a bakery is food_drink before it is
+# retail, because food_drink comes first.
+_TYPE_TO_CATEGORY: Dict[str, str] = {}
+for _c in CATEGORIES:
+    for _t in _c.types:
+        _TYPE_TO_CATEGORY.setdefault(_t, _c.key)
+
+
+def categorise(types: Sequence[str], primary: Optional[str] = None) -> Optional[str]:
+    """The category a place belongs to, from Google's own type list.
+
+    The primary type wins if it is one we know; otherwise the first known
+    type in the list; otherwise None -- a park, a monument, a bus stop that
+    the transport category does not name -- which is kept, and counted as
+    "other", because it still occupied one of the twenty slots.
+    """
+    if primary and primary in _TYPE_TO_CATEGORY:
+        return _TYPE_TO_CATEGORY[primary]
+    for t in types:
+        if t in _TYPE_TO_CATEGORY:
+            return _TYPE_TO_CATEGORY[t]
+    return None
 
 
 class CountStore:
-    """Per-cell counts and place ids, in one SQLite file.
+    """Every place, with its coordinates and category, keyed by the cell that
+    found it -- and a per-cell log so a run can resume.
 
-    Ids are kept, not just totals, for two reasons.  Neighbouring cells' query
-    circles overlap by about a fifth, so a city total taken by adding cell
-    counts would double-count the overlap -- with ids it is a set union and
-    exact.  And a second run months later can diff against the first, which a
-    stored integer cannot support.
+    Places are stored once per (cell, id).  Neighbouring query circles overlap
+    by about a fifth, so a place near a seam is found from two cells and
+    stored under both; a city total is a DISTINCT over ids and exact.
     """
 
     def __init__(self, path: str):
@@ -97,60 +114,74 @@ class CountStore:
         with self._lock:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS cell_census (
-                    cell TEXT NOT NULL,
-                    category TEXT NOT NULL,
+                    cell TEXT PRIMARY KEY,
                     resolution INTEGER NOT NULL,
                     n INTEGER NOT NULL,
                     calls INTEGER NOT NULL,
-                    max_depth INTEGER NOT NULL,
-                    exact INTEGER NOT NULL DEFAULT 1,
-                    PRIMARY KEY (cell, category)
+                    max_depth INTEGER NOT NULL
                 )""")
             self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS cell_places (
+                CREATE TABLE IF NOT EXISTS places (
                     cell TEXT NOT NULL,
-                    category TEXT NOT NULL,
                     place_id TEXT NOT NULL,
-                    PRIMARY KEY (cell, category, place_id)
+                    name TEXT,
+                    lat REAL NOT NULL,
+                    lng REAL NOT NULL,
+                    primary_type TEXT,
+                    types TEXT,
+                    category TEXT,
+                    address TEXT,
+                    business_status TEXT,
+                    PRIMARY KEY (cell, place_id)
                 )""")
             self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS ix_places_id ON cell_places(place_id)")
+                "CREATE INDEX IF NOT EXISTS ix_places_id ON places(place_id)")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_places_cat ON places(category)")
             self.conn.commit()
 
-    def is_done(self, cell: str, category: str) -> bool:
+    def is_done(self, cell: str) -> bool:
         with self._lock:
-            row = self.conn.execute(
-                "SELECT 1 FROM cell_census WHERE cell=? AND category=?",
-                (cell, category)).fetchone()
-        return row is not None
+            return self.conn.execute(
+                "SELECT 1 FROM cell_census WHERE cell=?", (cell,)).fetchone() is not None
 
-    def record(self, cell: str, category: str, res: int, ids: Set[str],
-               calls: int, depth: int, exact: bool = True) -> None:
+    def record(self, cell: str, res: int, places: Dict[str, dict],
+               calls: int, depth: int) -> None:
+        rows = []
+        for pid, p in places.items():
+            rows.append((cell, pid, p.get("name"), p["lat"], p["lng"],
+                         p.get("primary_type"), ",".join(p.get("types", ())),
+                         p.get("category"), p.get("address"), p.get("status")))
         with self._lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO cell_census VALUES (?,?,?,?,?,?,?)",
-                (cell, category, res, len(ids), calls, depth, int(exact)))
+                "INSERT OR REPLACE INTO cell_census VALUES (?,?,?,?,?)",
+                (cell, res, len(places), calls, depth))
             self.conn.executemany(
-                "INSERT OR IGNORE INTO cell_places VALUES (?,?,?)",
-                [(cell, category, pid) for pid in ids])
+                "INSERT OR REPLACE INTO places VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
             self.conn.commit()
 
     def counts(self, resolution: Optional[int] = None) -> Dict[str, Dict[str, int]]:
-        """cell -> category -> count, the shape berlin.scoring wants."""
-        sql = "SELECT cell, category, n FROM cell_census"
+        """cell -> category -> count, the shape berlin.scoring wants.
+
+        Uncategorised places come back under "other" so a cell's total is
+        still the number of things Google put there.
+        """
+        sql = ("SELECT p.cell, COALESCE(p.category, 'other'), COUNT(*) "
+               "FROM places p JOIN cell_census c ON c.cell = p.cell")
         params: List = []
         if resolution is not None:
-            sql += " WHERE resolution=?"
+            sql += " WHERE c.resolution=?"
             params.append(resolution)
+        sql += " GROUP BY p.cell, p.category"
         out: Dict[str, Dict[str, int]] = {}
         with self._lock:
             for cell, category, n in self.conn.execute(sql, params):
                 out.setdefault(cell, {})[category] = n
         return out
 
-    def unique_entities(self, category: Optional[str] = None) -> int:
-        """City total, deduplicated -- what adding up the cells cannot give."""
-        sql = "SELECT COUNT(DISTINCT place_id) FROM cell_places"
+    def unique_places(self, category: Optional[str] = None) -> int:
+        """City total, deduplicated across the seams between cells."""
+        sql = "SELECT COUNT(DISTINCT place_id) FROM places"
         params: List = []
         if category:
             sql += " WHERE category=?"
@@ -158,21 +189,49 @@ class CountStore:
         with self._lock:
             return self.conn.execute(sql, params).fetchone()[0]
 
+    def iter_places(self):
+        """One row per distinct place, for export."""
+        sql = ("SELECT place_id, name, lat, lng, primary_type, types, category, "
+               "address, business_status FROM places GROUP BY place_id")
+        with self._lock:
+            return self.conn.execute(sql).fetchall()
+
     def close(self) -> None:
         with self._lock:
             self.conn.close()
 
 
-class HexCensus:
-    """Count one category across a list of H3 cells."""
+def _parse(raw: dict) -> Optional[dict]:
+    """Flatten one Nearby Search result; None if it has no usable position."""
+    pid = raw.get("id") or raw.get("name")
+    loc = raw.get("location") or {}
+    if not pid or "latitude" not in loc or "longitude" not in loc:
+        return None
+    types = list(raw.get("types") or [])
+    primary = raw.get("primaryType")
+    display = raw.get("displayName") or {}
+    return {
+        "id": pid,
+        "name": display.get("text") if isinstance(display, dict) else display,
+        "lat": float(loc["latitude"]),
+        "lng": float(loc["longitude"]),
+        "types": types,
+        "primary_type": primary,
+        "category": categorise(types, primary),
+        "address": raw.get("formattedAddress"),
+        "status": raw.get("businessStatus"),
+    }
 
-    def __init__(self, client, store: CountStore, category: Category,
-                 resolution: int, workers: int = 5, resume: bool = True,
+
+class HexCensus:
+    """Count and locate everything across a list of H3 cells, in one pass."""
+
+    def __init__(self, client, store: CountStore, resolution: int,
+                 workers: int = 5, resume: bool = True,
                  language_code: Optional[str] = None,
                  region_code: Optional[str] = "DE"):
         self.client = client
         self.store = store
-        self.category = category
         self.resolution = resolution
         self.workers = max(1, workers)
         self.resume = resume
@@ -181,83 +240,60 @@ class HexCensus:
         self.stats = CensusStats()
         self._lock = threading.Lock()
 
-    def _search(self, circle, types: Sequence[str]) -> List[dict]:
+    def _search(self, circle) -> List[dict]:
         return self.client.search_nearby(
             circle,
-            included_types=list(types),
-            # Distance, not popularity: with no review count to read there is
-            # no way to tell a saturated circle's tail is in view, so the only
-            # sound rule is "a full 20 means split", and that needs the nearest
-            # 20 rather than the most famous 20 -- ranked by popularity the
-            # same well-known places come back however small the circle gets.
+            # No type filter: everything Google has in the circle.
+            included_types=(),
+            # Distance, not popularity.  The stopping rule is "a full twenty
+            # means split", and that only surfaces new places if a smaller
+            # circle returns its *nearest* twenty rather than its most famous.
             rank_preference="DISTANCE",
             language_code=self.language_code,
             region_code=self.region_code,
         )
 
-    def count_cell(self, cell: str) -> Set[str]:
-        """Every place id inside one cell's query circle."""
-        ids, exact, calls, depth = self._count(cell, self.category.types, 0)
-        with self._lock:
-            self.stats.calls += calls
-            self.stats.max_depth = max(self.stats.max_depth, depth)
-            if not exact:
-                self.stats.inexact_cells += 1
-        self.store.record(cell, self.category.key, self.resolution,
-                          ids, calls, depth, exact)
-        return ids
-
-    def _count(self, cell: str, types: Sequence[str], descent: int):
-        """Ids in ``cell``'s circle for ``types``, splitting types first.
-
-        Returns (ids, exact, calls, deepest_descent).  ``exact`` is False only
-        where a single type saturated a cell and the count had to fall back to
-        descending the grid, whose child circles reach outside the parent.
-        """
-        from allrestaurants.geo import Circle
+    def count_cell(self, cell: str) -> Dict[str, dict]:
+        """Every place inside one cell's query circle, with coordinates."""
+        from allrestaurants.geo import Circle, haversine_m
 
         lat, lng, radius = hexgrid.cell_query_circle(cell)
-        circle = Circle(lat, lng, radius, descent)
-        ids: Set[str] = set()
-        exact = True
+        found: Dict[str, dict] = {}
         calls = 0
-        deepest = descent
-        pending: List[List[str]] = [list(types)]
-
-        while pending:
-            subset = pending.pop()
-            places = self._search(circle, subset)
+        deepest = 0
+        clipped = 0
+        queue = [Circle(lat, lng, radius, 0)]
+        while queue:
+            circle = queue.pop()
+            raw_places = self._search(circle)
             calls += 1
-            for raw in places:
-                pid = raw.get("id") or raw.get("name")
-                if pid:
-                    ids.add(pid)
-            if len(places) < MAX_RESULTS_PER_CALL:
-                continue
-            with self._lock:
-                self.stats.splits += 1
-            if len(subset) > 1:
-                # Halve the type list against the same circle: exact, free,
-                # and the halves are meaningful sub-categories in themselves.
-                mid = len(subset) // 2
-                pending.append(subset[:mid])
-                pending.append(subset[mid:])
-                continue
-            # One type, still twenty deep. Only now does geometry move.
-            if descent >= MAX_DESCENT:
-                exact = False
-                continue
-            for child in hexgrid.children(cell):
-                c_ids, c_exact, c_calls, c_depth = self._count(
-                    child, subset, descent + 1)
-                ids |= c_ids
-                exact = False        # child circles reach outside the parent
-                calls += c_calls
-                deepest = max(deepest, c_depth)
-        return ids, exact, calls, deepest
+            deepest = max(deepest, circle.depth)
+            for raw in raw_places:
+                p = _parse(raw)
+                if p is None:
+                    continue
+                # A child circle reaches outside the cell; keep only what
+                # falls inside the cell's own circle.  This is the whole
+                # reason coordinates make the count exact.
+                if haversine_m(lat, lng, p["lat"], p["lng"]) > radius:
+                    clipped += 1
+                    continue
+                found[p["id"]] = p
+            saturated = len(raw_places) >= MAX_RESULTS_PER_CALL
+            if saturated and circle.depth < MAX_DEPTH \
+                    and circle.radius_m / 2 >= MIN_RADIUS_M:
+                queue.extend(circle.children())
+                with self._lock:
+                    self.stats.splits += 1
+        with self._lock:
+            self.stats.calls += calls
+            self.stats.clipped += clipped
+            self.stats.max_depth = max(self.stats.max_depth, deepest)
+        self.store.record(cell, self.resolution, found, calls, deepest)
+        return found
 
     def _guarded(self, cell: str) -> int:
-        if self.resume and self.store.is_done(cell, self.category.key):
+        if self.resume and self.store.is_done(cell):
             with self._lock:
                 self.stats.cells_skipped += 1
             return 0
@@ -270,7 +306,7 @@ class HexCensus:
             return 0
         with self._lock:
             self.stats.cells_done += 1
-            self.stats.entities += len(found)
+            self.stats.places += len(found)
         return len(found)
 
     def run(self, cells: Sequence[str]) -> CensusStats:

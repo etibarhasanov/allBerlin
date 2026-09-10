@@ -248,28 +248,24 @@ def refresh_cost(places: float, sku: Sku) -> Dict[str, float]:
 
 
 def ids_only_is_a_false_economy(places: float, total_eateries: float) -> Dict[str, float]:
-    """Why the free IDs-Only SKU does not make a *rated* dataset free.
+    """Why a free-discovery-then-details plan does not make a *rated* dataset cheap.
 
-    Scope matters here, and this function is about one half of it.  For a
-    census of counts -- how many private entities stand near a point, which is
-    what berlin/census.py prices -- IDs-Only is exactly the right SKU and the
-    whole job is free.  What follows applies only when the deliverable carries
-    ratings and review counts per place.
-
-    Nearby Search Essentials (IDs Only) costs nothing, without limit, which
-    invites an obvious plan: discover every place for free, then buy details
-    only for what you want.  It does not work, for two compounding reasons.
+    The free IDs-Only tiers -- Text Search and Place Details have one; Nearby
+    Search, despite what an earlier version of this file said, does not --
+    invite an obvious plan: discover every place for free, then buy details
+    only for what you want.  For a dataset that carries ratings it fails, for
+    two compounding reasons.
 
     An IDs-only response carries no review count, so the stopping rule has
-    nothing to read.  The sweep has to run as a census -- split every full
-    circle until nothing saturates -- which on the Tallinn fixture cost 2,176
-    calls against 358, six times more.  Free calls, so far so good.
+    nothing to read.  Discovery has to run as a census -- every place, not
+    just the ones above the bar -- which on the Tallinn fixture was 2,176
+    calls against 358.  Free calls, so far so good.
 
     But a census finds *everything*, and most of everything is the long tail
-    below the review bar.  You then hold ~3.5x as many IDs as you wanted, with
-    no way to tell which are which until you buy details at $20 per 1,000 --
-    eleven times the $1.75 per place that Nearby Search Enterprise charges when
-    it returns 20 places for one $0.035 call.
+    below the review bar.  You then hold ~3.5x as many ids as you wanted, with
+    no way to tell which are which until you buy Place Details Enterprise at
+    $20 per 1,000 -- one place per call -- against $35 per 1,000 for a Nearby
+    Search call that returns twenty.
     """
     from .pricing import DETAILS_ENTERPRISE
 

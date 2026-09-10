@@ -9,18 +9,19 @@ import sys
 from typing import List, Optional
 
 from . import __version__, hexgrid
-from .census import (BERLIN_PRIVATE_ENTITIES, BERLIN_REGISTERED_COMPANIES,
-                     DEFAULT_QPS, DEFAULT_SCORING_RESOLUTION, MAPPABLE_SHARE,
+from .census import (ALL_POI_FACTOR, BERLIN_PRIVATE_ENTITIES,
+                     BERLIN_REGISTERED_COMPANIES, DEFAULT_QPS,
+                     DEFAULT_SCORING_RESOLUTION, MAPPABLE_SHARE,
                      enrichment_cost, entities_in, modelled_counts,
                      modelled_population, plan_census, settled_density,
-                     total_entities)
+                     total_entities, two_stage_cost)
 from .districts import DISTRICTS
 from .entities import (ANCHOR_CATEGORIES, CATEGORIES, PRIVATE_CATEGORIES,
                        by_key, types_argument)
 from .geometry import BERLIN_AREA_KM2, berlin_area_km2, berlin_bbox_area_km2
 from .hexgrid import resolution, resolution_table
 from .pricing import (DETAILS_ENTERPRISE, DETAILS_SKUS, FREE_TRIAL_USD,
-                      NEARBY_IDS, NEARBY_PRO, NEARBY_SKUS)
+                      NEARBY_PRO, NEARBY_SKUS, TEXT_SKUS)
 from .scoring import PROFILES, build_features, profile, score_cells, top_cells
 
 
@@ -70,67 +71,79 @@ def cmd_categories(args) -> int:
 
 
 def cmd_census(args) -> int:
-    plan = plan_census(res=args.res)
+    plan = plan_census(res=args.res, months=args.months)
     r = resolution(plan.res)
-    print(f"\n  Counting every private entity in Berlin, on an H3 res-{plan.res} grid")
-    print(f"  ({r.cell_area_km2:.3f} km2 a cell, {r.edge_m:.0f} m across the "
-          f"corner, {plan.cells:,} cells)\n")
-    head = (f"  {'category':<22}{'entities':>10}{'saturated':>11}"
-            f"{'calls':>10}{'hours':>7}")
-    print(head)
-    print("  " + "-" * (len(head) - 2))
-    for p in sorted(plan.passes, key=lambda p: -p.calls):
-        print(f"  {p.category.key:<22}{p.entities:>10,.0f}{p.saturated_cells:>11,}"
-              f"{p.calls:>10,.0f}{p.hours:>7.1f}")
-    print("  " + "-" * (head.__len__() - 2))
-    print(f"  {'TOTAL':<22}{plan.entities:>10,.0f}{plan.saturated_cells:>11,}"
-          f"{plan.calls:>10,.0f}{plan.hours:>7.1f}")
+    p = plan.passes[0]
+    print(f"\n  Every place Google indexes in Berlin, with coordinates and types,")
+    print(f"  on an H3 res-{plan.res} grid ({r.cell_area_km2:.3f} km2 a cell, "
+          f"{r.edge_m:.0f} m to the corner, {plan.cells:,} cells)\n")
+    print(f"  one untyped Nearby Search per cell, quartered where it saturates")
+    print(f"    cells                : {p.cells:,}")
+    print(f"    cells over the cap   : {p.saturated_cells:,}")
+    print(f"    calls                : {p.calls:,.0f}")
+    print(f"    private entities     : {p.entities:,.0f}  "
+          f"(x{ALL_POI_FACTOR} of everything, parks and bus stops included)")
+    print(f"    wall clock           : {plan.hours:.1f} h at {DEFAULT_QPS:.0f}/s")
     b = plan.billing()
-    print(f"\n  SKU  : {plan.sku.name}")
-    print(f"  COST : ${b['usd']:,.2f}")
-    print(f"  TIME : {plan.hours:.1f} hours at {DEFAULT_QPS:.0f} calls/second\n")
-    print("  The whole census is free because IDs-Only carries no monthly cap.")
-    print("  What it costs is wall-clock, so the number to manage is calls, and")
-    print("  the lever on calls is the resolution.\n")
+    print(f"\n  SKU  : {plan.sku.name}  (${plan.sku.usd_per_1000:.2f}/1,000, "
+          f"{plan.sku.free_calls_per_month:,} free a month)")
+    print(f"  COST : ${b['usd']:,.2f}   (list ${b['usd_before_free_tier']:,.2f}, "
+          f"over {plan.months} month(s))\n")
+    print("  The resolution is a genuine trade-off here, not a monotone:")
     for alt in (8, 9, 10):
-        if alt == plan.res:
-            continue
-        other = plan_census(res=alt)
-        print(f"    res {alt}: {other.cells:>7,} cells, {other.calls:>9,.0f} calls, "
-              f"{other.hours:>5.1f} h")
-    print()
+        other = plan_census(res=alt, months=args.months)
+        mark = "  <-" if alt == plan.res else ""
+        print(f"    res {alt}: {other.cells:>7,} cells, {other.calls:>8,.0f} calls, "
+              f"{other.saturated_cells:>6,} split, ${other.billing()['usd']:>9,.2f}{mark}")
+    print("\n  Coarser cells save the empty-cell floor and pay for it in splitting;")
+    print("  finer cells do the reverse. Res 9 sits at the bottom of the curve.\n")
     return 0
 
 
 def cmd_cost(args) -> int:
-    plan = plan_census(res=args.res)
-    print(f"\n  Berlin private-entity census, H3 res {plan.res}\n")
-    print(f"  entities (modelled) : {plan.entities:,.0f}")
-    print(f"  cells               : {plan.cells:,}")
-    print(f"  API calls           : {plan.calls:,.0f}")
-    print(f"  wall clock          : {plan.hours:.1f} hours at "
-          f"{DEFAULT_QPS:.0f} calls/second")
-    print(f"\n  COST: ${plan.billing()['usd']:,.2f}   "
-          f"({NEARBY_IDS.name}, free with no monthly cap)\n")
-    print(f"  Against a ${FREE_TRIAL_USD:.0f} free trial credit, this spends "
-          f"none of it.\n")
-
-    print("  What you would pay if you wanted more than a count:\n")
-    e = enrichment_cost(plan.entities, plan.calls)
-    print(f"    the same sweep at Pro (name, address, location, types)")
-    print(f"      {plan.calls:,.0f} calls x ${NEARBY_PRO.usd_per_1000:.2f}/1,000 "
-          f"= ${e['sweep_at_pro_usd']:,.2f}")
-    print(f"    {e['details_sku']} afterwards on every id, one place per call")
-    print(f"      {plan.entities:,.0f} calls = ${e['details_per_entity_usd']:,.2f}")
+    plan = plan_census(res=args.res, months=args.months)
+    b = plan.billing()
+    print(f"\n  Berlin: every entity with coordinates and a category, H3 res {plan.res}\n")
+    print(f"  ROUTE A  {plan.sku.name}, one untyped pass")
+    print(f"    {plan.calls:,.0f} calls, {plan.hours:.1f} h, "
+          f"{plan.entities:,.0f} private entities")
+    print(f"    ${b['usd']:,.2f} after {b['free_calls']:,.0f} free calls   "
+          f"(list ${b['usd_before_free_tier']:,.2f})")
+    two = plan_census(res=plan.res, months=2).billing()
+    if plan.months == 1:
+        print(f"    ${two['usd']:,.2f} if the run straddles two months")
     print()
-    print("  Note which way round that is. For a review-bearing dataset the")
-    print("  free SKU is a trap, because an id with no review count forces a")
-    print("  census and then $20/1,000 of Place Details to find out what you")
-    print("  collected. For a count there is nothing to find out afterwards:")
-    print("  the count IS the product, and the trap never springs.\n")
-    print("  The middle path, if some cells need detail: census everything for")
-    print(f"  free, then re-sweep only the cells you care about at Pro. A "
-          f"hundred\n  cells is ${100 * NEARBY_PRO.usd_per_call:,.2f}.\n")
+
+    t = two_stage_cost(plan.entities, res=plan.res, months=plan.months)
+    print(f"  ROUTE B  free discovery, then coordinates and types per id")
+    print(f"    1. {t['discovery_sku']}: {t['discovery_calls']:,.0f} calls, "
+          f"{t['discovery_hours']:.1f} h, $0.00")
+    print(f"    2. {t['details_sku']}: {t['details_calls']:,.0f} calls, "
+          f"${t['details_usd']:,.2f} after {t['details_free_calls']:,.0f} free")
+    print(f"    ${t['total_usd']:,.2f} in {plan.months} month(s); $0.00 spread over "
+          f"{t['months_to_be_free']} months at 10,000 free a month")
+    print(f"    CAVEAT: Text Search is a search, not an enumeration. Run it and")
+    print(f"    Route A over the same 50 cells and compare the id sets before")
+    print(f"    trusting it for a census. Unverified, this saving is not real.")
+    print()
+
+    trial = FREE_TRIAL_USD
+    print(f"  Against the ${trial:.0f} free trial credit:")
+    for label, usd in (("Route A, one month", b["usd"]), ("Route A, two months", two["usd"]),
+                       ("Route B, one month", t["total_usd"])):
+        verdict = "inside" if usd <= trial else f"${usd - trial:,.0f} over"
+        print(f"    {label:<22} ${usd:>8,.2f}   {verdict}")
+    print()
+
+    e = enrichment_cost(plan.entities, plan.calls)
+    print("  If you later want ratings and review counts as well (Enterprise):")
+    print(f"    re-run Route A at Enterprise     +${e['resweep_at_enterprise_extra_usd']:,.2f} on top")
+    print(f"    Place Details Enterprise per id  ${e['details_enterprise_usd']:,.2f}")
+    print()
+    print("  There is no free Nearby Search tier. Text Search and Place")
+    print("  Details have one; Nearby Search bills at Pro even for ids alone.")
+    print("  An earlier version of this tool said otherwise and priced the whole")
+    print("  census at $0.00. That figure was wrong.\n")
     return 0
 
 
@@ -182,7 +195,7 @@ def cmd_run(args) -> int:
         print("error: allberlin run needs the allRestaurants package:\n"
               "  pip install -e ../allRestaurants", file=sys.stderr)
         return 1
-    from .runner import CountStore, HexCensus
+    from .runner import FIELD_MASK, CountStore, HexCensus
 
     api_key = args.api_key or os.environ.get("GOOGLE_MAPS_API_KEY")
     if not api_key:
@@ -191,31 +204,64 @@ def cmd_run(args) -> int:
         return 1
 
     res = args.res or DEFAULT_SCORING_RESOLUTION
-    categories = ([by_key(k) for k in args.category] if args.category
-                  else list(CATEGORIES))
     cells = hexgrid.berlin_cells(res)
     if args.limit:
         cells = cells[:args.limit]
+    plan = plan_census(res=res)
+    per_cell = plan.calls / plan.cells
+    est_calls = per_cell * len(cells)
+    print(f"\n  {len(cells):,} cells at res {res}: about {est_calls:,.0f} calls, "
+          f"${est_calls * NEARBY_PRO.usd_per_call:,.2f} at list price.")
+    if args.max_requests:
+        print(f"  Hard cap: {args.max_requests:,} calls "
+              f"(${args.max_requests * NEARBY_PRO.usd_per_call:,.2f}).")
+    print()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s",
                         datefmt="%H:%M:%S")
+    os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
     store = CountStore(args.db)
-    # tier="ids" is the whole economic argument: the free SKU, no monthly cap.
-    client = PlacesClient(api_key=api_key, tier="ids", qps=args.qps,
+    # Pro tier: id, name, coordinates, types, address. Nothing dearer -- one
+    # rating in the mask would re-price every call to Enterprise.
+    client = PlacesClient(api_key=api_key, tier="standard", qps=args.qps,
                           max_requests=args.max_requests)
+    client.field_mask = FIELD_MASK
     try:
-        for category in categories:
-            census = HexCensus(client, store, category, res, workers=args.workers)
-            stats = census.run(cells)
-            print(f"  {category.key:<22}{stats.cells_done:>7,} cells "
-                  f"{stats.calls:>8,} calls {stats.entities:>8,} places "
-                  f"{stats.inexact_cells:>5,} inexact")
+        census = HexCensus(client, store, res, workers=args.workers)
+        stats = census.run(cells)
+        print(f"\n  cells done {stats.cells_done:,}  skipped {stats.cells_skipped:,}  "
+              f"failed {stats.cells_failed:,}")
+        print(f"  calls {stats.calls:,}  splits {stats.splits:,}  "
+              f"clipped {stats.clipped:,}  deepest split {stats.max_depth}")
     finally:
-        total = store.unique_entities()
+        total = store.unique_places()
         store.close()
-        print(f"\n  {total:,} distinct places, {client.request_count:,} calls, "
-              f"stored in {args.db}\n")
+        print(f"  {total:,} distinct places with coordinates, "
+              f"{client.request_count:,} calls, in {args.db}\n")
+    return 0
+
+
+def cmd_export(args) -> int:
+    """Write every distinct place -- id, name, lat, lng, category -- to CSV."""
+    import csv
+
+    from .runner import CountStore
+
+    if not os.path.exists(args.db):
+        print(f"error: no census at {args.db}. Run `allberlin run` first.",
+              file=sys.stderr)
+        return 1
+    store = CountStore(args.db)
+    rows = store.iter_places()
+    store.close()
+    with open(args.out, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["place_id", "name", "lat", "lng", "primary_type", "types",
+                    "category", "address", "business_status", "h3_r9"])
+        for r in rows:
+            w.writerow(list(r) + [hexgrid.h3.latlng_to_cell(r[2], r[3], 9)])
+    print(f"  wrote {len(rows):,} places to {args.out}")
     return 0
 
 
@@ -240,14 +286,17 @@ def cmd_facts(args) -> int:
 
 
 def cmd_skus(args) -> int:
-    print("\n  Nearby Search -- one call, up to 20 places\n")
+    print("\n  Nearby Search -- one call, up to 20 places. No IDs-Only tier.\n")
     _sku_table(NEARBY_SKUS)
+    print("\n  Text Search -- a query in a rectangle, up to 60 places over 3 pages\n")
+    _sku_table(TEXT_SKUS)
     print("\n  Place Details -- one call, one place you already have an id for\n")
     _sku_table(DETAILS_SKUS)
     print("\n  A request bills at the highest SKU any field in its mask belongs")
     print("  to. Asking for one review count on an otherwise-Pro call prices")
     print("  the whole call as Enterprise; there is no partial billing.")
-    print("\n  Which is why this product asks for nothing but the id.\n")
+    print("\n  Pro is the floor for Nearby Search, and Pro already carries the two")
+    print("  fields a location product needs beyond the id: coordinates and types.\n")
     return 0
 
 
@@ -256,7 +305,7 @@ def _sku_table(skus) -> None:
     print(head)
     print("  " + "-" * (len(head) - 2))
     for s in skus:
-        free = "unlimited" if s.usd_per_1000 == 0 else f"{s.free_calls_per_month:,}"
+        free = "no cap" if s.usd_per_1000 == 0 else f"{s.free_calls_per_month:,}"
         print(f"  {s.name:<40}{s.usd_per_1000:>10.2f}{free:>12}  {s.buys}")
 
 
@@ -273,6 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--res", type=int, default=None,
                        help=f"H3 resolution. Default {DEFAULT_SCORING_RESOLUTION} "
                             f"(~200 m cells, a five-minute walk).")
+        p.add_argument("--months", type=int, default=1,
+                       help="Calendar months the run spans; the free allowance "
+                            "applies once per month and does not roll over.")
         return p
 
     p = sub.add_parser("grid", help="H3 resolutions over Berlin.")
@@ -297,8 +349,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_profiles)
 
     p = with_res(sub.add_parser("run", help="Make the calls. Needs an API key."))
-    p.add_argument("--category", action="append",
-                   help="Category key; repeatable. Default: all of them.")
     p.add_argument("--db", default="data/berlin_census.db")
     p.add_argument("--api-key", help="Overrides GOOGLE_MAPS_API_KEY.")
     p.add_argument("--qps", type=float, default=DEFAULT_QPS)
@@ -308,6 +358,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-requests", type=int, default=None,
                    help="Hard call cap. The run stops cleanly and resumes.")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("export", help="Every place with coordinates and category, as CSV.")
+    p.add_argument("--db", default="data/berlin_census.db")
+    p.add_argument("--out", default="exports/berlin_places.csv")
+    p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("facts", help="Berlin in the numbers this model uses.")
     p.set_defaults(func=cmd_facts)

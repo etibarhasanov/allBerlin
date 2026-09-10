@@ -3,10 +3,11 @@
 > **Scope.** This calibrates the *paid, review-bearing* sweep in
 > `berlin/cost.py` — the one that collects a rating and a review count for
 > every place and is priced per call. It is not what the hex census costs.
-> The census breaks saturation by splitting the type list rather than the
-> circle, is billed at the free IDs-Only SKU, and is measured separately —
-> see the "part that is easy to get wrong" section of the README, and
-> `CALLS_PER_EXCESS_MULTIPLE` in `berlin/census.py`.
+> The census is one untyped Nearby Search Pro pass with geometric
+> splitting clipped by coordinates; its split cost uses the same
+> fixture-derived constant (`CALLS_PER_EXCESS_MULTIPLE` in
+> `berlin/census.py`) and is priced at Pro — there is no free Nearby
+> Search tier, whatever an earlier revision of these files said.
 
 The estimate in allRestaurants assumes every saturated circle splits into four.
 That is a reasonable-sounding rule and it has already been wrong once, by a

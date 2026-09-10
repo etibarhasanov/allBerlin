@@ -2,23 +2,73 @@
 
 import pytest
 
-from berlin.census import (BERLIN_PRIVATE_ENTITIES, CALLS_PER_EXCESS_MULTIPLE,
+from berlin.census import (ALL_POI_FACTOR, BERLIN_PRIVATE_ENTITIES,
+                           CALLS_PER_EXCESS_MULTIPLE,
                            DEFAULT_SCORING_RESOLUTION, cell_densities,
                            centre_gradient, cost_pass, enrichment_cost,
                            entities_in, modelled_counts, modelled_population,
-                           plan_census, settled_density, total_entities)
+                           plan_census, settled_density, total_entities,
+                           two_stage_cost)
 from berlin.districts import DISTRICTS, by_name
-from berlin.entities import by_key
+from berlin.entities import CATEGORIES, by_key
 from berlin.hexgrid import resolution
-from berlin.pricing import NEARBY_IDS, NEARBY_PRO
+from berlin.pricing import (DETAILS_ESSENTIALS, FREE_TRIAL_USD, NEARBY_PRO,
+                            TEXT_IDS)
 
 
-def test_the_census_is_free():
-    """The whole economic argument. IDs-Only has no monthly cap."""
+def test_the_census_is_not_free():
+    """Nearby Search has no IDs-Only tier. An earlier version of this test
+    asserted $0.00, and the whole plan was built on it."""
     plan = plan_census()
-    assert plan.sku is NEARBY_IDS
-    assert plan.billing()["usd"] == 0.0
-    assert plan.calls > 100_000
+    assert plan.sku is NEARBY_PRO
+    assert plan.billing()["usd"] > FREE_TRIAL_USD
+    assert plan.billing()["usd_before_free_tier"] == pytest.approx(
+        plan.calls * NEARBY_PRO.usd_per_call, rel=0.001)
+
+
+def test_one_untyped_pass_costs_a_fifth_of_twelve_typed_ones():
+    """Once every result carries its types, the category comes back with
+    it and the typed sweeps collapse into one."""
+    untyped = plan_census()
+    typed = plan_census(categories=CATEGORIES)
+    assert len(untyped.passes) == 1
+    assert len(typed.passes) == len(CATEGORIES)
+    assert untyped.calls < typed.calls / 3
+
+
+def test_the_untyped_pass_reports_private_entities_not_all_pois():
+    """The pass sees parks and bus stops too; the product counts businesses."""
+    plan = plan_census()
+    assert plan.entities == pytest.approx(BERLIN_PRIVATE_ENTITIES, rel=0.01)
+    p = cost_pass(None, 9)
+    assert p.entities == pytest.approx(BERLIN_PRIVATE_ENTITIES, rel=0.01)
+
+
+def test_res_9_is_the_bottom_of_the_cost_curve():
+    """Coarser cells split too much, finer cells pay the empty-cell floor.
+    This is a real crossover the model has to reproduce, not a default."""
+    costs = {r: plan_census(res=r).calls for r in (8, 9, 10)}
+    assert costs[9] < costs[8]
+    assert costs[9] < costs[10]
+
+
+def test_the_free_allowance_is_monthly():
+    one = plan_census(months=1).billing()["usd"]
+    two = plan_census(months=2).billing()["usd"]
+    assert two == pytest.approx(one - NEARBY_PRO.free_calls_per_month * NEARBY_PRO.usd_per_call)
+
+
+def test_two_stage_route_is_cheaper_but_conditional():
+    plan = plan_census()
+    t = two_stage_cost(plan.entities)
+    assert t["discovery_usd"] == 0.0
+    assert t["discovery_sku"] == TEXT_IDS.name
+    assert t["details_sku"] == DETAILS_ESSENTIALS.name
+    assert t["total_usd"] < plan.billing()["usd"]
+    assert t["total_usd"] == pytest.approx(
+        (plan.entities - DETAILS_ESSENTIALS.free_calls_per_month)
+        * DETAILS_ESSENTIALS.usd_per_call, rel=0.01)
+    assert t["months_to_be_free"] == 12
 
 
 def test_the_density_surface_integrates_to_the_modelled_total():
@@ -44,18 +94,10 @@ def test_density_ordering_matches_the_city():
     assert ranked[-1].name in {"Marzahn-Hellersdorf", "Spandau", "Reinickendorf"}
 
 
-def test_finer_resolutions_cost_more_calls_and_saturate_less():
+def test_finer_resolutions_saturate_less():
     coarse = plan_census(res=8)
     fine = plan_census(res=10)
-    assert fine.calls > coarse.calls
     assert fine.saturated_cells < coarse.saturated_cells
-
-
-def test_resolution_is_a_product_choice_not_a_cost_optimisation():
-    """Minimising calls alone would pick the coarsest grid every time, because
-    splitting is cheaper than laying seven cells. The default is not that."""
-    cheapest = min((8, 9, 10), key=lambda r: plan_census(res=r).calls)
-    assert cheapest == 8
     assert DEFAULT_SCORING_RESOLUTION == 9
 
 
@@ -73,21 +115,22 @@ def test_an_unsaturated_pass_costs_exactly_one_call_per_cell():
 
 
 def test_split_cost_is_linear_in_how_far_over_the_cap_a_cell_is():
-    """Measured against the type splitter in runner.py, not assumed."""
-    assert CALLS_PER_EXCESS_MULTIPLE == pytest.approx(3.75)
+    """Measured on the allRestaurants fixture for quartering, not assumed."""
+    assert CALLS_PER_EXCESS_MULTIPLE == pytest.approx(4.4)
 
 
 def test_hours_follow_calls():
     plan = plan_census()
     assert plan.hours == pytest.approx(plan.calls / 10.0 / 3600.0)
-    assert 1 < plan.hours < 12
+    assert 0.3 < plan.hours < 3
 
 
-def test_enrichment_is_where_the_money_would_be():
+def test_ratings_on_top_are_cheaper_by_resweep_than_by_details():
+    """Enterprise adds $3 per call; Details Enterprise is $20 per place.
+    At Berlin's places-per-call the re-sweep wins by an order of magnitude."""
     plan = plan_census()
     e = enrichment_cost(plan.entities, plan.calls)
-    assert e["sweep_at_pro_usd"] > 1000
-    assert plan.billing()["usd"] == 0
+    assert e["resweep_at_enterprise_extra_usd"] < e["details_enterprise_usd"] / 5
 
 
 def test_modelled_counts_cover_every_cell_and_category():

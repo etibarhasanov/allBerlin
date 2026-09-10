@@ -9,8 +9,8 @@ from berlin.cost import (CENSUS_MULTIPLIER, build_plan, calls_for,
                          ids_only_is_a_false_economy, refresh_cost,
                          share_above_bar)
 from berlin.districts import total_expected_places
-from berlin.pricing import (DETAILS_ENTERPRISE, NEARBY_ENTERPRISE, NEARBY_IDS,
-                            NEARBY_PRO, bill)
+from berlin.pricing import (DETAILS_ENTERPRISE, NEARBY_ENTERPRISE, NEARBY_PRO,
+                            TEXT_IDS, bill)
 
 
 def test_the_law_reproduces_the_measurement_it_came_from():
@@ -103,8 +103,16 @@ def test_free_tier_cannot_exceed_the_calls_made():
     assert bill(500, NEARBY_ENTERPRISE)["usd"] == 0
 
 
-def test_ids_only_costs_nothing():
-    assert bill(1_000_000, NEARBY_IDS)["usd"] == 0
+def test_text_search_ids_only_costs_nothing():
+    assert bill(1_000_000, TEXT_IDS)["usd"] == 0
+
+
+def test_there_is_no_free_nearby_search_tier():
+    """Text Search and Place Details have one. Nearby Search does not, and a
+    version of pricing.py that said otherwise priced a census at $0."""
+    from berlin import pricing
+    assert not hasattr(pricing, "NEARBY_IDS")
+    assert min(s.usd_per_1000 for s in pricing.NEARBY_SKUS) == NEARBY_PRO.usd_per_1000
 
 
 def test_bill_rejects_nonsense():

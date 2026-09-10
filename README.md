@@ -1,85 +1,97 @@
 # allBerlin
 
-A count of every private entity in Berlin, on a hexagonal grid, as the base
-layer for a location intelligence scoring product.
+Every place in Berlin with its **coordinates** and its **category**, indexed
+on a hexagonal grid, as the base layer for a location intelligence scoring
+product.
 
-Not a directory — a **surface**. For each cell you get how many businesses
-stand within a two-minute walk of it, broken down by what kind, plus the same
-for the ring around it. From that you can ask the only question a location
-product is really asked: *is this a good place to put this thing, and compared
-to what?*
+Not a directory — a **surface** with the points still in it. For each of
+10,155 cells you get what stands within a two-minute walk, what kind of thing
+each one is, and exactly where; from that you can ask the only question a
+location product is really asked: *is this a good place to put this thing,
+and compared to what?*
 
 ```bash
 git clone <this repo> && cd allBerlin
-pip install -e .
+pip install -e . -e ../allRestaurants
 
 allberlin grid            # the hex resolutions, and what each one is for
-allberlin census          # calls and hours for a full count of Berlin
-allberlin cost            # the money answer
+allberlin census          # calls, hours and cost for the whole city
+allberlin cost            # both routes, against the free trial
 allberlin score --profile food_site
 allberlin run             # make the calls (needs a Google Maps key)
+allberlin export          # place_id, name, lat, lng, category -> CSV
 ```
 
 ---
 
 ## The answer
 
-**It is free.** About **122,000 API calls**, **3.4 hours** of wall clock, and
-**$0.00**.
+**About 31,000 API calls, under an hour, and $840 — or $680 if the run
+straddles two calendar months.** That is one pass of Nearby Search Pro over
+the city, and it returns every place with its coordinates, its Google types,
+its name and its address.
 
-| | cells | calls | hours | cost |
+| | cells | calls | hours | after free tier |
 |---|---|---|---|---|
-| res 8 — a district view | 1,454 | 27,929 | 0.8 | **$0.00** |
-| **res 9 — a five-minute walk** | **10,155** | **122,274** | **3.4** | **$0.00** |
-| res 10 — a block | 71,114 | 853,368 | 23.7 | **$0.00** |
+| res 8 — a district view | 1,454 | 40,173 | 1.1 | $1,126 |
+| **res 9 — a five-minute walk** | **10,155** | **31,242** | **0.9** | **$840** |
+| res 10 — a block | 71,114 | 71,825 | 2.0 | $2,138 |
 
-That is twelve categories swept across the whole city, at a modelled **119,700
-private entities**. Nothing is spent against the $300 free trial credit, which
-stays available for whatever you want detail on later.
+Res 9 is the bottom of a real curve, not a default: coarser cells save the
+empty-cell floor and pay for it in splitting, finer cells do the reverse.
 
-The reason is one SKU. **Nearby Search Essentials (IDs Only)** returns place
-ids and nothing else — no name, no address, no coordinates, no rating — and
-Google prices it at $0.00 with **no monthly cap at all**, unlike the 1,000
-free Enterprise calls that a review-bearing sweep gets. A count product needs
-exactly that and nothing more. There is no second stage to pay for, because
-**the count is the product**.
+There is a cheaper route to the same two fields, and it is conditional:
 
-Worth being precise about how that inverts the answer for the other kind of
-dataset. If you want ratings per place, IDs-Only is a trap: an id carries no
-review count, so the review bar has nothing to read, the sweep has to run as a
-full census anyway, and then you pay $20 per 1,000 for Place Details on every
-id it turned up, one place per call, to find out what you collected. That path
-costs about $2,000 for Berlin. Counting skips the whole second half.
+| | calls | cost |
+|---|---|---|
+| **Route A** — Nearby Search Pro, one untyped pass | 31,242 | **$840** ($680 over two months) |
+| **Route B** — Text Search IDs-Only (free) to discover, then Place Details Essentials for coordinates and types | 123,000 + 119,700 | **$549** in one month, **$0** spread over twelve |
 
-**What you would pay if you wanted more than a count:**
+Route B's discovery step is a *search*, ranked against a query string — not
+an enumeration of a circle the way Nearby Search is. Nothing guarantees it
+finds everything. Before trusting it for a census, run both routes over the
+same fifty cells and compare the id sets. If they match, Route B is the price;
+if they do not, the saving was never real. `allberlin cost` says this every
+time it prints the figure.
 
-| | |
-|---|---|
-| the same sweep at Pro — name, address, location, types | $3,753 |
-| Place Details Pro afterwards, one call per place | $1,950 |
-| census everything free, then re-sweep 100 chosen cells at Pro | **$3.20** |
+Neither route fits inside the **$300 free trial credit** on its own. Route A
+over two months is $380 over; Route B in one month is $249 over, and free with
+patience.
 
-The last row is the one to plan on. Count everything for nothing; buy detail
-only where a decision actually turns on it.
+### A correction
+
+An earlier version of this repository priced the census at **$0.00**, on the
+strength of a "Nearby Search Essentials (IDs Only)" SKU. **There is no such
+SKU.** Text Search and Place Details each have a free IDs-Only tier; Nearby
+Search does not, and a Nearby Search request that asks for nothing but
+`places.id` is billed at Pro, $32 per 1,000. The `allrestaurants` price table
+carried the same error and has been corrected in the same change.
+
+It turns out to change less than it looks. Pro is the tier that carries
+`location` and `types` — precisely the two fields this product needs beyond
+the id — so the correction and the request for coordinates and categories are
+one and the same change. Once every result says what and where it is, two
+things happen:
+
+- **Category comes back with each place**, so the twelve typed passes of the
+  free design collapse into **one untyped pass**: a single request per cell,
+  no `includedTypes`, returns the nearest twenty of everything and each one
+  names its type. About a fifth of the calls.
+- **Coordinates make geometric splitting exact.** A saturated cell is
+  quartered and every result kept only if it lies inside the cell's own
+  circle. The IDs-only design could not filter on coordinates it did not have,
+  and had to split the type list instead; that machinery is gone.
 
 ## Why hexagons
 
 Every cell has six neighbours at one distance. A square grid has four edge
-neighbours and four corner ones 1.41× further away, and every "what is around
-here" question then has to pick a lie to tell about that. Since a location
-score is almost entirely a statement about a *neighbourhood*, a grid that
-distorts neighbourhoods distorts the product.
-
-A k-ring is 3k(k+1)+1 cells — 7, 19, 37 — and that is the whole catchment
-arithmetic. [H3](https://h3geo.org) is also a global standard index, so a cell
-id means the same thing here as in whatever you join the scores against later.
-
-Resolution is a **product decision, not a cost optimisation**. Minimising calls
-alone would pick res 8 every time, because breaking a saturated cell is cheaper
-than laying seven cells where one would do — but breaking a cell does not make
-the grid finer. Everything found still belongs to the cell being broken, so res
-8 gives 0.74 km² granularity however hard it works, and 0.74 km² is a
-neighbourhood, not a site.
+neighbours and four corner ones 1.41× further, and every "what is around
+here" question then has to pick a lie to tell about that. A location score is
+almost entirely a statement about a *neighbourhood*, so a grid that distorts
+neighbourhoods distorts the product. A k-ring is 3k(k+1)+1 cells — 7, 19, 37 —
+and that is the whole catchment arithmetic. [H3](https://h3geo.org) is a global
+standard index, so a cell id here means the same thing in whatever the scores
+are joined against later.
 
 | res | cell | across | what it is |
 |---|---|---|---|
@@ -87,64 +99,49 @@ neighbourhood, not a site.
 | **9** | **0.105 km²** | **201 m** | **a five-minute walk — the default** |
 | 10 | 0.015 km² | 76 m | a block, for siting one door |
 
-## The part that is easy to get wrong
+The grid decides the *query* granularity; with coordinates on every place,
+you can re-index the results to any resolution afterwards for nothing.
+`allberlin export` writes the res-9 cell of each place alongside its
+coordinates for exactly that reason.
 
-Google's Nearby Search takes a circle, so each cell is queried as the circle
-that circumscribes it. And it returns **at most 20 results** whatever the
-circle holds, so a cell in Mitte will come back full and hiding more.
+## What one place looks like
 
-The obvious fix — split the circle into four smaller ones, which is what
-[allRestaurants](https://github.com/etibarhasanov/allRestaurants) does — is
-wrong here, and quietly. Those four children sit at (±r/2, ±r/2) with radius
-r/√2, so they reach **1.43r** from the centre and drag in places from well
-outside the cell they are supposed to be measuring. Measured on a test clump:
-**75 places returned for a circle holding 62**, a 21% over-count. And it cannot
-be cleaned up afterwards, because an IDs-Only response has no coordinates to
-filter on. Every count in the product would be inflated, worst exactly where
-density is highest.
+```
+place_id        ChIJ...
+name            Bäckerei Siebert
+lat, lng        52.5448, 13.4071
+primary_type    bakery
+types           bakery,food_store,store,food,point_of_interest,establishment
+category        food_drink
+address         Schönfließer Str. 12, 10439 Berlin
+business_status OPERATIONAL
+h3_r9           891f1d48b17ffff
+```
 
-So saturation is broken by **splitting the type list instead of the circle**. A
-cell returning 20 for thirty retail types is asked again for fifteen of them,
-and again for the other fifteen, against the *identical circle*. Every result
-is still exactly where it was, the union is complete, the count stays exact —
-and the subsets are useful in their own right, because they are finer
-categories. Measured against clumps from 1.2× to 15× the cap:
+Category is read off Google's own type list through the taxonomy in
+`berlin/entities.py` — 179 types in 12 categories, the first match winning
+and the primary type winning over that. A place typed as nothing in the
+taxonomy (a park, a monument) is kept as `other`, because it still occupied
+one of the twenty slots and still says something about the block.
 
-| over the cap | 1.2× | 2.0× | 3.0× | 4.5× | 7.0× | 10× | 15× |
-|---|---|---|---|---|---|---|---|
-| extra calls | 2 | 4 | 6 | 14 | 20 | 30 | 58 |
-| count exact | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-
-3.75 extra calls per multiple of the cap, and exact every time. Only when a
-*single* type still saturates does geometry have to move, and then the cell
-descends to its seven H3 children and is **flagged inexact** in the store
-rather than reported alongside the clean ones.
-
-The ids are kept per cell, not just totals. Neighbouring circles overlap by
-about a fifth, so a city total taken by adding cell counts would double-count
-the seams — with ids it is a set union, and exact. Free calls still buy that.
-
-## From counts to a score
+## From places to a score
 
 Three things stand between a count and a score, and each is a decision that
 should be visible rather than buried in a weighting.
 
-**Neighbourhood.** What matters at a site is not what is in its own 0.1 km²
-cell but what is within a walk. Every feature has a catchment form summed over
-the k-ring.
+**Neighbourhood.** Every feature has a catchment form summed over the k-ring.
 
-**Comparability.** Raw counts are not comparable across features and their
-distributions are badly skewed — a mean-and-standard-deviation normalisation
-would be dominated by the top hundred cells in Mitte. Features become
-**percentile ranks** across the city: scale-free, robust to the skew, and
-readable. 0.9 means denser than 90% of Berlin. Ties share a rank, which matters
-because most cells hold zero of any given category and breaking those ties
-would make the bottom half of every score noise presented as signal.
+**Comparability.** Raw counts are badly skewed — a mean-and-standard-deviation
+normalisation would be dominated by the top hundred cells in Mitte. Features
+become **percentile ranks** across the city: 0.9 means denser than 90% of
+Berlin. Ties share a rank, because most cells hold zero of any given category
+and breaking those ties would make the bottom half of every score noise
+presented as signal.
 
-**Purpose.** There is no single good location. A site is good *for something*,
-so there is no default score — there are profiles, each a set of weights **and
-penalties**. A profile that cannot say "too much of this is bad" cannot express
-competition, and competition is most of what site selection is.
+**Purpose.** There is no single good location, so there is no default score —
+there are profiles, each a set of weights **and penalties**. A profile that
+cannot say "too much of this is bad" cannot express competition, and
+competition is most of what site selection is.
 
 | profile | question |
 |---|---|
@@ -154,59 +151,51 @@ competition, and competition is most of what site selection is.
 | `underserved` | Where do residents live with the least around them? |
 | `office` | Where is the weekday, daytime economy? |
 
-```
-$ allberlin score --profile food_site --top 3
-  rewards : catchment_k1 x1.0, transport x0.8, count_retail x0.4, ...
-  punishes: count_food_drink x0.6
-```
-
-`allberlin score` runs the whole pipeline against the **modelled** surface, so
-you can see the shape of the output before an API key is involved. It says so
-loudly every time. The model is smooth by construction and deliberately not
-roughened with plausible-looking noise, because a surface that looked like data
-would invite being used as data.
+`allberlin score` runs the pipeline against a **modelled** surface so the
+output can be seen before a key is involved, and says so loudly. The surface
+is smooth by construction — borough commercial intensity, a distance-to-centre
+gradient, a hex-ring smooth to remove the borough edges — and deliberately not
+roughened with plausible-looking noise, because a surface that looked like
+data would invite being used as data.
 
 ## What is measured and what is modelled
-
-The load-bearing distinction in the whole repo:
 
 | | source |
 |---|---|
 | H3 geometry, cell counts, ring sizes | **Exact** — computed |
-| SKU prices and free allowances | Google's pricing pages, September 2026 |
-| Type-splitting call cost (3.75 per excess multiple) | **Measured** against the splitter |
-| Quadtree over-count (21%) | **Measured** against a known clump |
+| SKU prices, free allowances, which endpoints have an IDs-Only tier | Google's pricing pages, September 2026 |
+| Quartering cost (4.4 calls per multiple of the cap) | **Measured** on the allRestaurants fixture |
+| Quadtree over-reach without coordinates (21%) | **Measured** against a known clump |
 | Berlin registered companies (190,000) | Published |
-| Mappable share (63%) | **Estimated** |
-| Commercial intensity per borough | **Estimated** |
-| Density gradient from the centre | **Estimated** — standard monocentric form |
-| Category shares of all entities | **Estimated** — replaced by the census itself |
+| Mappable share (63%), all-POI factor (1.35) | **Estimated** |
+| Commercial intensity per borough, density gradient | **Estimated** |
 
-Everything after `allberlin run` is measured. Everything before it exists only
-to size the run and to let the pipeline be tested without one.
-
-One cross-check does hold, and it is in the test suite. This model reaches
-Berlin's eateries through registered-company counts and gets **16,758**. The
-independent review-bar model in `berlin/cost.py` reaches them through Tallinn's
-measured gastronomy rate and gets **10,649 with 25+ reviews**. Two different
-routes, no shared inputs, and the second sits sensibly inside the first.
+Everything after `allberlin run` is measured. Everything before it exists to
+size the run and to let the pipeline be tested without one. One cross-check
+holds unarranged: this model reaches Berlin's eateries through
+registered-company counts and gets 16,758; the independent review-bar model
+in `berlin/cost.py` reaches them through Tallinn's measured gastronomy rate
+and gets 10,649 with 25+ reviews. Different routes, no shared inputs.
 
 ## Running it
 
 ```bash
 export GOOGLE_MAPS_API_KEY=...
 
-allberlin run --limit 50 --category food_drink     # a first look, ~50 calls
-allberlin run --res 9                              # the whole city
+allberlin run --limit 50                 # ~150 calls, ~$5: proves the key
+allberlin run --res 9 --max-requests 35000
+allberlin export --out exports/berlin_places.csv
 ```
 
-Restrict the key to **Places API (New)**, and note that the field mask is fixed
-at the ids tier in `runner.py` — that is the economic argument, not a default,
-so it is not exposed as a flag. Cells already done are skipped on a re-run:
-free calls still cost hours.
+Restrict the key to **Places API (New)**. The field mask is fixed at the Pro
+tier in `runner.py` — one rating in it would re-price every call to
+Enterprise — so it is not exposed as a flag. Cells already done are skipped on
+a re-run; at $32 per 1,000 that is money as well as hours.
 
-Results land in `data/berlin_census.db`: `cell_census` for counts, `cell_places`
-for the ids behind them, both keyed by H3 cell.
+Results land in `data/berlin_census.db`: `places` with one row per (cell, place)
+carrying coordinates, types and category; `cell_census` as the resume log. A
+place near a seam is found from two cells and stored under both; the city
+total is a `DISTINCT` over ids and exact.
 
 ## Layout
 
@@ -214,12 +203,12 @@ for the ids behind them, both keyed by H3 cell.
 |---|---|
 | `berlin/geometry.py` | Berlin's outline — the bounding box is 1.9× the city |
 | `berlin/hexgrid.py` | H3 grid, cell → query circle, k-rings, resolutions |
-| `berlin/entities.py` | What counts as a private entity, in Google's type vocabulary |
-| `berlin/census.py` | Calls, hours, density model, the modelled surface |
-| `berlin/runner.py` | The census itself: type-splitting, exact counts, resume |
+| `berlin/entities.py` | 179 Google types in 12 categories |
+| `berlin/pricing.py` | The SKUs, and which endpoints have a free tier |
+| `berlin/census.py` | Calls, hours, both routes, the modelled surface |
+| `berlin/runner.py` | The census: one untyped pass, clipped quartering, resume |
 | `berlin/scoring.py` | Features, percentile ranks, profiles |
-| `berlin/cost.py` | The paid alternative: a review-bearing sweep, priced |
-| `berlin/districts.py` | Boroughs — area, population, built-up share |
+| `berlin/cost.py` | The review-bearing variant, priced separately |
 
 ## Tests
 
@@ -227,20 +216,19 @@ for the ids behind them, both keyed by H3 cell.
 pip install -e ".[dev]" && pytest
 ```
 
-133 tests, no network. The ones that carry weight: that type-splitting returns
-the **exact** count at 25, 40, 90 and 200 places in a cell; that it never moves
-the circle; that ids deduplicate across the seam between neighbouring cells
-where naive addition inflates; that the density surface integrates to the
-modelled total; that a profile's penalty can outweigh its rewards; and that
-`underserved` does **not** peak in the middle of Berlin, which it would if the
-profile were measuring supply twice and calling one of them demand.
+144 tests, no network. The ones that carry weight: that a saturated cell is
+quartered to the **exact** count at 25, 40, 90 and 200 places; that results
+a child circle returns from outside the cell are clipped; that every stored
+place has coordinates and a category; that ids deduplicate across the seam
+between cells where naive addition inflates; that `pricing.py` has **no**
+`NEARBY_IDS`; and that `underserved` does not peak in the middle of Berlin.
 
 ## Terms of service
 
-Google allows place ids to be cached **indefinitely**, which is unusually
-convenient here: ids are the entire dataset. The 30-day limit applies to
-content — names, ratings, addresses — and this collects none of it. A count
-derived from ids is your own derived statistic, but if the counts are going to
-be sold as a product rather than used internally, read
+Place ids may be cached indefinitely. Coordinates, names, addresses and types
+are content, and content generally may not be kept beyond 30 days — so a
+dataset with coordinates in it needs refreshing monthly (Place Details
+Essentials at $5 per 1,000, 10,000 free a month, is the cheap way), and if it
+is going to be sold as a product rather than used internally, read
 [the Maps Platform terms](https://cloud.google.com/maps-platform/terms)
 sections 3.2.3 and 3.2.4 and get it reviewed.

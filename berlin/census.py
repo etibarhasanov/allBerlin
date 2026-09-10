@@ -1,22 +1,33 @@
-"""What a full private-entity census of Berlin costs.
+"""What a full private-entity census of Berlin costs -- with coordinates and a
+category for every entity, not just a count.
 
-The answer turns on one SKU.  Google's **Nearby Search Essentials (IDs Only)**
-returns place ids and nothing else, and it is free with no monthly cap.  A
-product that needs to know *how many* entities stand near a point, and of what
-kind, needs exactly that and nothing else -- so the whole census is free, and
-the constraint is wall-clock time rather than money.
+The first version of this file priced the census at $0 on the free
+"Nearby Search IDs-Only" tier.  There is no such tier.  Text Search and Place
+Details each have a free IDs-Only SKU; Nearby Search does not, and a Nearby
+Search request billing on nothing but ``places.id`` is billed at Pro, $32 per
+1,000.  The correction is recorded here rather than tidied away because the
+mistake is an easy one to make again.
 
-That is the opposite of the conclusion for a review-bearing dataset, and the
-reason is worth keeping straight.  Collecting ratings makes IDs-Only useless,
-because an id carries no review count, so the review bar has nothing to read
-and the sweep must run as a census anyway -- and then you pay $20 per 1,000 for
-Place Details on every id the census turned up, one place per call.  Counting
-skips that second half entirely.  There is nothing to enrich: the count *is*
-the product.
+It turns out to change less than it looks.  Pro is the tier that carries
+``location`` and ``types``, and those are the two fields a location product
+actually needs beyond the id.  Once you are paying for them, two things happen:
 
-The cost model here is therefore not about money.  It is about calls, because
-calls are hours, and about which resolution keeps cells under the 20-result cap
-so that splitting stays rare.
+* **Category comes back with every place**, so the twelve typed passes
+  collapse into one untyped pass over the whole city.  A single request per
+  cell, no ``includedTypes`` at all, returns the nearest twenty of everything
+  and each one says what it is.
+* **Coordinates make geometric splitting exact.**  A saturated cell can be
+  quartered and its results clipped to the cell's own circle, which the
+  IDs-only design could not do and had to work around by splitting the type
+  list instead.
+
+So the paid census is one pass, about a fifth of the calls the free one would
+have taken, and it delivers the richer dataset.  The cheapest route to the
+same fields is a two-stage one -- free Text Search discovery, then Place
+Details Essentials at $5 per 1,000 with 10,000 free a month -- and it is
+priced here too, with the caveat that Text Search is a search rather than an
+enumeration and has to be checked against Nearby Search on a few cells before
+being trusted for a census.
 """
 
 from __future__ import annotations
@@ -29,7 +40,8 @@ from . import hexgrid
 from .districts import DISTRICTS, District
 from .entities import CATEGORIES, PRIVATE_CATEGORIES, Category
 from .hexgrid import MAX_RESULTS_PER_CALL, Resolution, resolution
-from .pricing import NEARBY_IDS, NEARBY_PRO, Sku, bill
+from .pricing import (DETAILS_ESSENTIALS, NEARBY_PRO, TEXT_IDS, Sku, bill,
+                      FREE_TRIAL_USD)
 
 # Berlin has roughly 190,000 registered companies.  Not all of them are a place
 # on a map: holding companies, freelancers registered at home addresses and
@@ -64,17 +76,22 @@ DEFAULT_QPS = 10.0
 # schools -- is treated as this fraction of all entities for sizing purposes.
 ANCHOR_SHARE = 0.02
 
-# A cell over the 20-result cap is resolved by halving its type list against
-# the same circle, not by moving the circle -- see runner.py for why.  Measured
-# by running that splitter against clumps from 1.2x to 15x the cap, the extra
-# calls come out linear in how far over the cap the cell is:
-#
-#     over the cap   1.2x  2.0x  3.0x  4.5x  7.0x  10x  15x
-#     extra calls       2     4     6    14    20   30   58
-#
-# which is 3.75 extra calls per multiple of the cap, and every one of those
-# runs returned the exact count.
-CALLS_PER_EXCESS_MULTIPLE = 3.75
+# An untyped Nearby Search returns every kind of place Google indexes, not just
+# private entities: bus stops, parks, ATMs, churches, monuments.  They count
+# against the 20-result cap like anything else, so the untyped pass sees more
+# density than the private-entity total suggests.  Estimated; the first fifty
+# cells of a real run will say what it actually is.
+ALL_POI_FACTOR = 1.35
+
+# A saturated cell is quartered into four covering circles and each result is
+# kept only if it falls inside the parent's own circle -- exact, now that
+# results carry coordinates.  Measured on the allRestaurants fixture, a
+# saturated circle costs about 4.4 further calls per multiple of the cap
+# before its children come back under it; a little more than the 3.75 the
+# type-splitting route cost, because four quadrants overlap one another where
+# two halves of a type list did not.
+CALLS_PER_EXCESS_MULTIPLE = 4.4
+
 
 
 def entities_in(district: District) -> float:
@@ -121,6 +138,7 @@ class CensusPlan:
     res: int
     sku: Sku
     cells: int
+    months: int = 1
 
     @property
     def calls(self) -> float:
@@ -139,7 +157,7 @@ class CensusPlan:
         return sum(p.saturated_cells for p in self.passes)
 
     def billing(self) -> Dict[str, float]:
-        return bill(int(round(self.calls)), self.sku)
+        return bill(int(round(self.calls)), self.sku, self.months)
 
 
 _DENSITY_CACHE: Dict[int, List[float]] = {}
@@ -268,10 +286,19 @@ DEFAULT_SCORING_RESOLUTION = 9
 CANDIDATE_RESOLUTIONS = (8, 9, 10)
 
 
-def cost_pass(category: Category, res: int) -> CategoryPass:
-    """Calls to sweep the whole city for one category at one resolution."""
+def cost_pass(category: Optional[Category], res: int) -> CategoryPass:
+    """Calls to sweep the whole city at one resolution.
+
+    With ``category`` None this is the untyped pass -- one request per cell for
+    everything Google has there, which is how a Pro sweep is run.  With a
+    category it is the old typed pass, kept for sizing a Text Search
+    discovery, where each query names one type.
+    """
     r = resolution(res)
-    share = category.share if category.private else ANCHOR_SHARE
+    if category is None:
+        share = ALL_POI_FACTOR
+    else:
+        share = category.share if category.private else ANCHOR_SHARE
     saturated = 0
     calls = 0.0
     entities = 0.0
@@ -283,40 +310,91 @@ def cost_pass(category: Category, res: int) -> CategoryPass:
             saturated += 1
             excess = expected / MAX_RESULTS_PER_CALL - 1.0
             calls += CALLS_PER_EXCESS_MULTIPLE * excess
-    return CategoryPass(category, res, len(cell_densities(res)), saturated,
+    if category is None:
+        # Report the private-entity total, not the all-POI total the pass
+        # actually sees -- that is the figure the product is about.
+        entities /= ALL_POI_FACTOR
+    label = category if category is not None else UNTYPED
+    return CategoryPass(label, res, len(cell_densities(res)), saturated,
                         calls, entities)
+
+
+# Stands in for "no type filter" in a CategoryPass, so the plan can be printed
+# with the same code whether it is one untyped pass or twelve typed ones.
+UNTYPED = Category("all", "Everything Google indexes", 1.0, ["*"], private=True,
+                   note="One untyped request per cell.")
 
 
 def plan_census(res: Optional[int] = None,
                 categories: Optional[Sequence[Category]] = None,
-                sku: Sku = NEARBY_IDS) -> CensusPlan:
-    """Cost a category-by-category census of Berlin.
+                sku: Sku = NEARBY_PRO, months: int = 1) -> CensusPlan:
+    """Cost a Nearby Search Pro census of Berlin: one untyped pass.
 
-    Every category is swept at the same resolution, because that resolution is
-    the granularity of the product and the categories have to line up cell for
-    cell to be compared within one.
+    Pass ``categories`` to cost the older typed design instead -- one pass per
+    category -- which is what a Text Search discovery would have to do, since
+    a Text Search query filters on a single type.
     """
-    cats = list(categories or CATEGORIES)
     res = DEFAULT_SCORING_RESOLUTION if res is None else res
-    passes = [cost_pass(category, res) for category in cats]
-    return CensusPlan(passes, res, sku, len(cell_densities(res)))
+    if categories:
+        passes = [cost_pass(c, res) for c in categories]
+    else:
+        passes = [cost_pass(None, res)]
+    return CensusPlan(passes, res, sku, len(cell_densities(res)), months)
+
+
+def two_stage_cost(entities: float, res: Optional[int] = None,
+                   months: int = 1) -> Dict[str, float]:
+    """The cheapest route to the same fields, and what it depends on.
+
+    Stage one discovers ids with Text Search on its free IDs-Only tier: one
+    query per cell per category, each paged up to three times.  Stage two
+    buys coordinates and types for every id with Place Details Essentials, at
+    $5 per 1,000 and 10,000 free each month -- so a 120,000-entity city is
+    about $550 in one month, or nothing at all spread over a year.
+
+    The dependency is stage one.  Text Search is a search, ranked against a
+    query string; nothing guarantees it enumerates a rectangle the way Nearby
+    Search enumerates a circle.  Before trusting it for a census, run both
+    over the same fifty cells and compare the id sets.  If Text Search finds
+    what Nearby finds, this route is a fifth of the price.  If it does not,
+    the saving was never real.
+    """
+    res = DEFAULT_SCORING_RESOLUTION if res is None else res
+    typed = plan_census(res=res, categories=CATEGORIES, sku=TEXT_IDS)
+    # Each Text Search query pages up to three times before it is exhausted;
+    # most cells need one page, saturated ones need all three.
+    discovery_calls = typed.calls + 2 * typed.saturated_cells
+    details = bill(int(round(entities)), DETAILS_ESSENTIALS, months=months)
+    return {
+        "discovery_sku": TEXT_IDS.name,
+        "discovery_calls": discovery_calls,
+        "discovery_hours": discovery_calls / DEFAULT_QPS / 3600.0,
+        "discovery_usd": 0.0,
+        "details_sku": DETAILS_ESSENTIALS.name,
+        "details_calls": details["calls"],
+        "details_free_calls": details["free_calls"],
+        "details_usd": details["usd"],
+        "months_to_be_free": math.ceil(entities / DETAILS_ESSENTIALS.free_calls_per_month),
+        "total_usd": details["usd"],
+    }
 
 
 def enrichment_cost(entities: float, calls: float) -> Dict[str, float]:
-    """What the same sweep would cost if you wanted more than a count.
+    """What the fields a Pro sweep does not carry would cost on top.
 
-    Two ways to spend money on this, and they are very different sizes.  The
-    cheaper is to re-run the sweep at Pro, which returns name, address,
-    location and types twenty at a time.  The other is Place Details on every
-    id afterwards, one place per call, which is what you are forced into if the
-    sweep itself was IDs-only and you change your mind later.
+    Ratings and review counts are Enterprise, and there are two ways to add
+    them: re-run the sweep at Enterprise ($35 per 1,000, +$3 on every call) or
+    fetch Place Details Enterprise for each id afterwards ($20 per 1,000, one
+    place per call).  Which is cheaper depends only on how many places a call
+    found on average -- past about 0.6 places per call the sweep wins.
     """
-    from .pricing import DETAILS_PRO
+    from .pricing import DETAILS_ENTERPRISE, NEARBY_ENTERPRISE
 
+    sweep = bill(int(round(calls)), NEARBY_ENTERPRISE)["usd"] \
+        - bill(int(round(calls)), NEARBY_PRO)["usd"]
     return {
-        "sweep_at_pro_usd": bill(int(round(calls)), NEARBY_PRO)["usd"],
-        "details_sku": DETAILS_PRO.name,
-        "details_per_entity_usd": bill(int(round(entities)), DETAILS_PRO)["usd"],
+        "resweep_at_enterprise_extra_usd": max(0.0, sweep),
+        "details_enterprise_usd": bill(int(round(entities)), DETAILS_ENTERPRISE)["usd"],
         "entities": entities,
         "calls": calls,
     }
