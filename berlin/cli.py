@@ -262,11 +262,19 @@ def cmd_export(args) -> int:
     store.close()
     with open(args.out, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["place_id", "name", "lat", "lng", "primary_type", "types",
-                    "category", "address", "business_status", "h3_r9"])
-        for r in rows:
-            w.writerow(list(r) + [hexgrid.h3.latlng_to_cell(r[2], r[3], 9)])
-    print(f"  wrote {len(rows):,} places to {args.out}")
+        if args.minimal:
+            # Exactly the three fields a density product needs and nothing
+            # else. No id, no name: nothing that identifies a business.
+            w.writerow(["lat", "lng", "category"])
+            for r in rows:
+                w.writerow([r[2], r[3], r[6] or "other"])
+        else:
+            w.writerow(["place_id", "name", "lat", "lng", "primary_type", "types",
+                        "category", "address", "business_status", "h3_r9"])
+            for r in rows:
+                w.writerow(list(r) + [hexgrid.h3.latlng_to_cell(r[2], r[3], 9)])
+    print(f"  wrote {len(rows):,} places to {args.out}"
+          + (" (lat, lng, category only)" if args.minimal else ""))
     return 0
 
 
@@ -451,6 +459,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("export", help="Every place with coordinates and category, as CSV.")
     p.add_argument("--db", default="data/berlin_census.db")
     p.add_argument("--out", default="exports/berlin_places.csv")
+    p.add_argument("--minimal", action="store_true",
+                   help="Only lat, lng, category -- nothing that names a business.")
     p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("facts", help="Berlin in the numbers this model uses.")

@@ -96,3 +96,28 @@ def test_density_is_measured_from_place_coordinates(tmp_path, capsys):
     assert d.cells == 1
     main(["density", "--at", "Small:52.5219,13.4132:0.5", "--db", str(tmp_path / "c.db")])
     assert "MEASURED" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(
+    pytest.importorskip("allrestaurants", reason="needs allRestaurants") is None,
+    reason="needs allRestaurants")
+def test_minimal_export_is_exactly_three_columns(tmp_path, capsys):
+    """lat, lng, category. Nothing that identifies a business."""
+    import csv
+    from berlin.runner import CountStore
+
+    db = tmp_path / "c.db"
+    store = CountStore(str(db))
+    cell = hexgrid.berlin_cells(9)[5000]
+    store.record(cell, 9, {
+        "a": dict(lat=52.52, lng=13.41, types=["cafe"], category="food_drink", name="Cafe A"),
+        "b": dict(lat=52.53, lng=13.42, types=["park"], category=None, name="Park B"),
+    }, calls=1, depth=0)
+    store.close()
+    out = tmp_path / "min.csv"
+    assert main(["export", "--db", str(db), "--out", str(out), "--minimal"]) == 0
+    rows = list(csv.reader(out.open()))
+    assert rows[0] == ["lat", "lng", "category"]
+    assert sorted(r[2] for r in rows[1:]) == ["food_drink", "other"]
+    assert all(len(r) == 3 for r in rows)
+    assert "Cafe A" not in out.read_text()
